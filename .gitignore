@@ -1,0 +1,5 @@
+logs
+snapshot
+*.pyc
+*.jpg
+*.pkl
