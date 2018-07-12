@@ -1,0 +1,51 @@
+NAME: 'horse'
+IS_TRAIN: false
+
+VAL:
+    MASKDIR: '/home/dalong/data/horse_cow/val_covers/'
+    OUTDIR: '/home/dalong/data/toolbox_pytorch/examples/inpainting/results/horse'
+    INIT: 'snapshot/horse_1527850566/G_1999.pkl'
+
+DATASET:
+    TRAINDIR: '/home/dalong/data/horse_cow/train_images/'
+    VALDIR: '/home/dalong/data/horse_cow/val_images/'
+    INPUT_RES: 256
+    LOCAL_RES: 128
+    HOLE_MIN: 32
+    HOLE_MAX: 127
+    MEAN: [0.4560,  0.4472,  0.4155]
+
+LOSS:
+  ALPHA: 0.0004 # 0.0004
+
+TRAIN_G_EPOCHES: -1
+TRAIN_D_EPOCHES: 60
+TOTAL_EPOCHES: 2000
+  
+INIT_G: '/home/dalong/data/toolbox_pytorch/examples/inpainting/completionnet_places2.t7'
+INIT_D: ~
+# INIT_G: '/home/dalong/data/toolbox_pytorch/examples/inpainting/G_48_0.pkl'  
+# INIT_D: '/home/dalong/data/toolbox_pytorch/examples/inpainting/D_48_0.pkl'
+
+SOLVER:
+  WORKERS: 4
+  IMG_PER_GPU: 24
+  GPU_IDS: [0] # real BATCHSIZE is : IMG_PER_GPU * len(GPU_IDS) 
+  LR: 0.0001
+  LR_SCHEDULE: 'standard'
+  OPTIMIZER: 'ADAM' # ADAM | SGD
+  MOMENTUM: 0.9
+  WEIGHTDECAY: 0.0004
+  
+LOGS:
+  PRINT_FREQ: 10
+  SNAPSHOT_FREQ: 100
+  SNAPSHOT_MAXFILES: NOTIMPLEMENT
+  SNAPSHOT_DIR: 'snapshot'
+  LOG_FREQ: 9999
+  LOG_DIR: 'logs'
+  LOG_SHUTIL_ON: true
+  # shutil.copytree('./', './logs2', ignore=shutil.ignore_patterns('./logs','*.zip','*.mp4','*.jpg','*.png','__pycache__', '*.pyc'))
+  LOG_SHUTIL_IGNORELIST: ['*.zip','*.mp4','*.jpg','*.png','*.pyc','*.so','*.pkl','*.caffemodel', '__pycache__','snapshot','logs']
+  LOG_SHUTIL_IGNOREFILE: '.gitignore'
+  

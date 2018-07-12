@@ -1,3 +1,17 @@
+# Monkey-patch because I trained with a newer version.
+# This can be removed once PyTorch 0.4.x is out.
+# See https://discuss.pytorch.org/t/question-about-rebuild-tensor-v2/14560
+import torch._utils
+try:
+    torch._utils._rebuild_tensor_v2
+except AttributeError:
+    def _rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad, backward_hooks):
+        tensor = torch._utils._rebuild_tensor(storage, storage_offset, size, stride)
+        tensor.requires_grad = requires_grad
+        tensor._backward_hooks = backward_hooks
+        return tensor
+    torch._utils._rebuild_tensor_v2 = _rebuild_tensor_v2
+
 import torch
 import torch.nn as nn
 import torchvision
@@ -27,12 +41,13 @@ args = parser.parse_args()
 CONFIG = edict(yaml.load(open(args.config, 'r')))
 print ('==> CONFIG is: \n', CONFIG, '\n')
 
-LOGDIR = '%s/%s_%d'%(CONFIG.LOGS.LOG_DIR, CONFIG.NAME, int(time.time()))
-SNAPSHOTDIR = '%s/%s_%d'%(CONFIG.LOGS.SNAPSHOT_DIR, CONFIG.NAME, int(time.time()))
-if not os.path.exists(LOGDIR):
-    os.makedirs(LOGDIR)
-if not os.path.exists(SNAPSHOTDIR):
-    os.makedirs(SNAPSHOTDIR)
+if CONFIG.IS_TRAIN:
+    LOGDIR = '%s/%s_%d'%(CONFIG.LOGS.LOG_DIR, CONFIG.NAME, int(time.time()))
+    SNAPSHOTDIR = '%s/%s_%d'%(CONFIG.LOGS.SNAPSHOT_DIR, CONFIG.NAME, int(time.time()))
+    if not os.path.exists(LOGDIR):
+        os.makedirs(LOGDIR)
+    if not os.path.exists(SNAPSHOTDIR):
+        os.makedirs(SNAPSHOTDIR)
 
 def to_varabile(arr, requires_grad=False, is_cuda=True):
     if type(arr) == np.ndarray:
@@ -274,7 +289,7 @@ class GLCIC_D(nn.Module):
                     m.weight.data.normal_(0, .1)
                     m.bias.data.zero_()
         else:
-            self.load_state_dict(torch.load(pretrainfile))
+            self.load_state_dict(torch.load(pretrainfile, map_location=lambda storage, loc: storage))
             print ('==> [netD] load self-train weight as pretrain.')
 
     
@@ -325,15 +340,16 @@ class MyDataset(object):
         self.imgdir = ImageDir
         self.imglist = os.listdir(ImageDir)
         print ('==> Load Dataset: \n', {'dataset': ImageDir, 'istrain:': istrain, 'len': self.__len__()}, '\n')
+        assert istrain==CONFIG.IS_TRAIN
         
     def __len__(self):
         return len(self.imglist)
 
     def __getitem__(self, idx):
-        path = os.path.join(self.imgdir, self.imglist[idx])
-        return self.loadImage(path)
+        return self.loadImage(idx)
     
-    def loadImage(self, path):
+    def loadImage(self, idx):
+        path = os.path.join(self.imgdir, self.imglist[idx])
         image = cv2.imread(path)
         image = image[:,:,::-1]
         image = cv2.resize(image, (CONFIG.DATASET.INPUT_RES, CONFIG.DATASET.INPUT_RES), interpolation=cv2.INTER_LINEAR)
@@ -344,10 +360,15 @@ class MyDataset(object):
             bbox_c, mask_c = self.randommask(image.shape[0], image.shape[1])
             bbox_d, mask_d = self.randommask(image.shape[0], image.shape[1])
         else:
-            mask_c = cv2.imread(path.replace('images', 'masks')).astype(np.float32)
-            bbox_c = 0
-            mask_d = 0
-            bbox_d = 0
+            if  CONFIG.NAME in ['horse', 'LIP', 'ATR']:
+                mask_c = cv2.imread('%s/%s'%(CONFIG.VAL.MASKDIR, self.imglist[idx].replace('jpg', 'png')), cv2.IMREAD_GRAYSCALE).astype(np.float32)
+                
+            mask_c = cv2.resize(mask_c, (CONFIG.DATASET.INPUT_RES, CONFIG.DATASET.INPUT_RES), interpolation=cv2.INTER_NEAREST)
+            mask_c = mask_c[np.newaxis, :,:]
+            mask_c[mask_c>=1] = 1.0
+            mask_c[mask_c<1] = 0.0
+            return np.float32(input), np.float32(mask_c), np.int32(idx)
+        
         return np.float32(input), np.float32(mask_c), bbox_c, np.float32(mask_d), bbox_d
     
     def randommask(self, height, width):
@@ -391,15 +412,16 @@ def train(dataLoader, model_G, model_D, epoch):
         input3ch, mask_c, bbox_c, mask_d, bbox_d = data
         input4ch = torch.cat([input3ch * (1 - mask_c), mask_c], dim=1)
         
-        input3ch_var = to_varabile(input3ch, requires_grad=False, is_cuda=True)
+        input3ch_var = to_varabile(input3ch, requires_grad=False, is_cuda=True) + MEAN_var
         input4ch_var = to_varabile(input4ch, requires_grad=True, is_cuda=True)
         bbox_c_var = to_varabile(bbox_c, requires_grad=False, is_cuda=True)
+        mask_c_var = to_varabile(mask_c, requires_grad=True, is_cuda=True)
         
         out_G = model_G(input4ch_var)
         loss_G_L2 = model_G.calc_loss(out_G, input3ch_var)
         losses_G_L2.update(loss_G_L2.data[0], input3ch.size(0))
         
-        completion = (input3ch_var + MEAN_var)*(1 - mask_c.cuda()) + out_G * mask_c.cuda()
+        completion = (input3ch_var)*(1 - mask_c_var) + out_G * mask_c_var
 #         local_completion = completion[:,:,bbox_c[0][1]:bbox_c[0][3], bbox_c[0][0]:bbox_c[0][2]]
 #         local_input3ch = input3ch_var[:,:,bbox_c[0][1]:bbox_c[0][3], bbox_c[0][0]:bbox_c[0][2]]
         local_completion = CropAlignOp(completion, bbox_c_var, 
@@ -412,11 +434,12 @@ def train(dataLoader, model_G, model_D, epoch):
         loss_D_fake = model_D.calc_loss(out_D_fake, torch.zeros_like(out_D_fake))
         losses_D_fake.update(loss_D_fake.data[0], input3ch.size(0))
         
-        out_D_real = model_D(local_input3ch+MEAN_var, input3ch_var+MEAN_var)
+        out_D_real = model_D(local_input3ch, input3ch_var)
         loss_D_real = model_D.calc_loss(out_D_real, torch.ones_like(out_D_real))
         losses_D_real.update(loss_D_real.data[0], input3ch.size(0))
         
-        out_G_real = model_D(local_completion, completion)
+        #out_G_real = model_D(local_completion, completion) # TODO
+        out_G_real = out_D_fake
         loss_G_real = model_D.calc_loss(out_G_real, torch.ones_like(out_G_real))
         losses_G_real.update(loss_G_real.data[0], input3ch.size(0))
         
@@ -474,18 +497,18 @@ def train(dataLoader, model_G, model_D, epoch):
                    D_fake=losses_D_fake, D_real=losses_D_real ))
         
         if i % CONFIG.LOGS.LOG_FREQ == 0:
-            vis = torch.cat([input3ch_var * (1 - mask_c.cuda()) + MEAN_var,
+            vis = torch.cat([input3ch_var * (1 - mask_c_var),
                              completion], dim=0)
-            save_image(vis, os.path.join(LOGDIR, 'epoch%d_%d_vis.jpg'%(epoch, i)), nrow=input3ch.size(0), padding=2,
+            save_image(vis.data, os.path.join(LOGDIR, 'epoch%d_%d_vis.jpg'%(epoch, i)), nrow=input3ch.size(0), padding=2,
                        normalize=True, range=None, scale_each=True, pad_value=0)
         
-            vis = torch.cat([local_input3ch + MEAN_var, local_completion], dim=0)
-            save_image(vis, os.path.join(LOGDIR, 'epoch%d_%d_vis_crop.jpg'%(epoch, i)), nrow=input3ch.size(0), padding=2,
-                       normalize=True, range=None, scale_each=True, pad_value=0)
+#             vis = torch.cat([local_input3ch + MEAN_var, local_completion], dim=0)
+#             save_image(vis, os.path.join(LOGDIR, 'epoch%d_%d_vis_crop.jpg'%(epoch, i)), nrow=input3ch.size(0), padding=2,
+#                        normalize=True, range=None, scale_each=True, pad_value=0)
             
-        if i % CONFIG.LOGS.SNAPSHOT_FREQ == 0:
-            torch.save(model_G.state_dict(), os.path.join(SNAPSHOTDIR, 'G_%d_%d.pkl'%(epoch,i)))
-            torch.save(model_D.state_dict(), os.path.join(SNAPSHOTDIR, 'D_%d_%d.pkl'%(epoch,i)))
+        #if i % CONFIG.LOGS.SNAPSHOT_FREQ == 0 :
+        #    torch.save(model_G.state_dict(), os.path.join(SNAPSHOTDIR, 'G_%d_%d.pkl'%(epoch,i)))
+        #    torch.save(model_D.state_dict(), os.path.join(SNAPSHOTDIR, 'D_%d_%d.pkl'%(epoch,i)))
     
     if epoch == CONFIG.TRAIN_G_EPOCHES:
         torch.save(model_G.state_dict(), os.path.join(SNAPSHOTDIR, 'preG_%d_%d.pkl'%(epoch,i)))
@@ -497,21 +520,78 @@ def main():
     dataset = MyDataset(ImageDir=CONFIG.DATASET.TRAINDIR, istrain=True)
     
     BATCHSIZE = CONFIG.SOLVER.IMG_PER_GPU * len(CONFIG.SOLVER.GPU_IDS)
-    dataLoader = torch.utils.data.DataLoader(dataset, batch_size=BATCHSIZE, shuffle=False, num_workers=CONFIG.SOLVER.WORKERS, pin_memory=False)
+    dataLoader = torch.utils.data.DataLoader(dataset, batch_size=BATCHSIZE, shuffle=True, num_workers=CONFIG.SOLVER.WORKERS, pin_memory=False)
     
-    model_G = GLCIC_G(bias_in_conv=True, pretrainfile=CONFIG.INIT).cuda()
-    model_D = GLCIC_D(bias_in_conv=True).cuda()
+    model_G = GLCIC_G(bias_in_conv=True, pretrainfile=CONFIG.INIT_G).cuda()
+    model_D = GLCIC_D(bias_in_conv=True, pretrainfile=CONFIG.INIT_D).cuda()
     
-    epoches = 200
+    epoches = CONFIG.TOTAL_EPOCHES
     for epoch in range(epoches):
         print ('===========>   [Epoch %d] training    <==========='%epoch)
         train(dataLoader, model_G, model_D, epoch)
+        if epoch % CONFIG.LOGS.SNAPSHOT_FREQ == 0 :
+            torch.save(model_G.state_dict(), os.path.join(SNAPSHOTDIR, 'G_%d.pkl'%(epoch)))
+            torch.save(model_D.state_dict(), os.path.join(SNAPSHOTDIR, 'D_%d.pkl'%(epoch)))
     
+    torch.save(model_G.state_dict(), os.path.join(SNAPSHOTDIR, 'G_%d.pkl'%(epoch)))
+    torch.save(model_D.state_dict(), os.path.join(SNAPSHOTDIR, 'D_%d.pkl'%(epoch)))
+    
+def test():
+    from blend import blend
+    if not os.path.exists(CONFIG.VAL.OUTDIR):
+        os.makedirs(CONFIG.VAL.OUTDIR)
+    
+    dataset = MyDataset(ImageDir=CONFIG.DATASET.VALDIR, istrain=False)
+    dataLoader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=1, pin_memory=False)
+    
+    model_G = GLCIC_G(bias_in_conv=True, pretrainfile=CONFIG.VAL.INIT).cuda()
+        
+    # switch to eval mode
+    model_G.eval()
+
+    for data in tqdm(dataLoader):
+
+        input3ch, mask_c, idxs = data
+        filename = dataset.imglist[idxs.numpy()[0]]
+        input4ch = torch.cat([input3ch * (1 - mask_c), mask_c], dim=1)
+        
+        input3ch_var = to_varabile(input3ch, requires_grad=False, is_cuda=True) + MEAN_var
+        input4ch_var = to_varabile(input4ch, requires_grad=False, is_cuda=True)
+        mask_c_var = to_varabile(mask_c, requires_grad=False, is_cuda=True)
+        
+        out_G = model_G(input4ch_var)        
+        completion = (input3ch_var)*(1 - mask_c_var) + out_G * mask_c_var
+        
+        completion_np = completion.data.cpu().numpy().transpose((0, 2, 3, 1))[0] *255.0
+        
+        path = os.path.join(dataset.imgdir, filename)
+        
+        image = cv2.imread(path)[:,:,::-1]
+        completion_np = cv2.resize(completion_np, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
+        completion_np = np.uint8(completion_np)
+        
+        mask = cv2.imread('%s/%s'%(CONFIG.VAL.MASKDIR, filename.replace('jpg', 'png')))
+        mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
+        completion_np[mask<0.5] = image[mask<0.5]
+        
+#         target = image    # background
+#         source = completion_np    # foreground
+#         mask = mask
+#         completion_np = blend(target, source, mask, offset=(0, 0))
+        
+        cv2.imwrite('%s/%s'%(CONFIG.VAL.OUTDIR, filename), np.uint8(completion_np[:,:,::-1]))
+        
+#         vis = np.hstack((cv2.imread(path), mask, completion_np[:,:,::-1]))
+#         cv2.imwrite('%s/%s'%(CONFIG.VAL.OUTDIR, filename), np.uint8(vis))
+#         break
+                
     
     
 if __name__ == '__main__':
-    main()
-    
+    if CONFIG.IS_TRAIN:
+        main()
+    else:
+        test()
     
     
     
