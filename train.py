@@ -446,7 +446,7 @@ def train(dataLoader, model_G, model_D, epoch):
         if epoch <= CONFIG.TRAIN_G_EPOCHES:
             optimizer = torch.optim.Adam(model_G.parameters(), 
                                          CONFIG.SOLVER.LR, weight_decay=CONFIG.SOLVER.WEIGHTDECAY) 
-            loss_G = losses_G_L2
+            loss_G = loss_G_L2
             losses_G.update(loss_G.data[0], input3ch.size(0))
             optimizer.zero_grad()
             loss_G.backward()
